@@ -19,16 +19,18 @@ const {
 
 function cleanToken(raw) {
   let t = String(raw || "").trim();
-  // Remove aspas que às vezes colam no Render
   if (
     (t.startsWith('"') && t.endsWith('"')) ||
     (t.startsWith("'") && t.endsWith("'"))
   ) {
     t = t.slice(1, -1).trim();
   }
-  // Remove prefixo "Bot " se alguém colou errado
   if (t.toLowerCase().startsWith("bot ")) t = t.slice(4).trim();
   return t;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 const TOKEN = cleanToken(process.env.DISCORD_TOKEN);
@@ -47,11 +49,7 @@ if (!TOKEN) {
 }
 
 console.log(
-  "[Yukina-Bot] Token length=" +
-    TOKEN.length +
-    " | começa com=" +
-    TOKEN.slice(0, 8) +
-    "..."
+  "[Yukina-Bot] Token length=" + TOKEN.length + " | começa com=" + TOKEN.slice(0, 8) + "..."
 );
 
 function httpJson(url, headers) {
@@ -65,7 +63,12 @@ function httpJson(url, headers) {
         try {
           json = body ? JSON.parse(body) : null;
         } catch (_) {}
-        resolve({ status: res.statusCode, json, body });
+        resolve({
+          status: res.statusCode,
+          json,
+          body,
+          retryAfter: Number(res.headers["retry-after"] || 0),
+        });
       });
     });
     req.on("error", reject);
@@ -110,8 +113,7 @@ async function handlePainelSlash(interaction) {
     !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
   ) {
     return interaction.reply({
-      content:
-        "🔒 Você precisa da permissão **Gerenciar servidor** para abrir este painel.",
+      content: "🔒 Você precisa da permissão **Gerenciar servidor** para abrir este painel.",
       flags: MessageFlags.Ephemeral,
     });
   }
@@ -143,8 +145,7 @@ async function handlePainelPrefix(message) {
   }
   const link = buildPanelUrl(message.guildId, message.guild.name);
   return message.reply({
-    content:
-      "❄️ **Painel de Configurações da Yukina**\nAbra o painel:\n\n🔗 " + link,
+    content: "❄️ **Painel de Configurações da Yukina**\nAbra o painel:\n\n🔗 " + link,
     allowedMentions: { parse: [] },
   });
 }
@@ -177,9 +178,7 @@ async function onReady() {
     const rest = new REST({ version: "10" }).setToken(TOKEN);
     const body = [painelCommand.toJSON()];
     if (GUILD_ID) {
-      await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), {
-        body,
-      });
+      await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body });
       console.log("[Slash] /painel no servidor " + GUILD_ID);
     } else {
       await rest.put(Routes.applicationCommands(client.user.id), { body });
@@ -231,44 +230,67 @@ process.on("unhandledRejection", (r) => {
 
 (async () => {
   try {
-    console.log("[Yukina-Bot] Validando token na API Discord...");
-    const me = await httpJson("https://discord.com/api/v10/users/@me", {
-      Authorization: "Bot " + TOKEN,
-      "User-Agent": "Yukina-Bot",
-    });
+    // Health sobe primeiro; depois validamos o token com retry em 429
+    let me = null;
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      console.log("[Yukina-Bot] Validando token (tentativa " + attempt + "/6)...");
+      me = await httpJson("https://discord.com/api/v10/users/@me", {
+        Authorization: "Bot " + TOKEN,
+        "User-Agent": "Yukina-Bot",
+      });
 
-    if (me.status === 401 || me.status === 403) {
-      console.error(
-        "[Yukina-Bot] TOKEN INVÁLIDO (HTTP " +
-          me.status +
-          "). Reset o token no Discord Developer Portal e atualize DISCORD_TOKEN no Render (sem aspas)."
-      );
-      // Mantém o health vivo para o Render não ficar em loop de crash
-      return;
+      if (me.status === 401 || me.status === 403) {
+        console.error(
+          "[Yukina-Bot] TOKEN INVÁLIDO (HTTP " +
+            me.status +
+            "). Reset no portal e atualize DISCORD_TOKEN no Render."
+        );
+        return;
+      }
+
+      if (me.status === 429) {
+        const fromBody = Number(me.json && me.json.retry_after);
+        const waitSec = Math.min(
+          90,
+          Math.max(5, fromBody || me.retryAfter || 15)
+        );
+        console.warn(
+          "[Yukina-Bot] Rate limit 429 — aguardando " +
+            waitSec +
+            "s antes de tentar de novo (não faça deploy nesse meio tempo)."
+        );
+        await sleep(waitSec * 1000);
+        continue;
+      }
+
+      if (me.status === 200 && me.json && me.json.username) {
+        console.log(
+          "[Yukina-Bot] Token OK: " +
+            me.json.username +
+            " (id " +
+            me.json.id +
+            ")"
+        );
+        break;
+      }
+
+      console.warn("[Yukina-Bot] REST HTTP " + me.status + " — nova tentativa em 10s");
+      await sleep(10000);
     }
-    if (me.status === 429) {
-      console.warn("[Yukina-Bot] Rate limit 429 na REST — tentando login mesmo assim...");
-    } else if (me.status === 200 && me.json && me.json.username) {
-      console.log(
-        "[Yukina-Bot] Token OK: " +
-          me.json.username +
-          (me.json.discriminator && me.json.discriminator !== "0"
-            ? "#" + me.json.discriminator
-            : "") +
-          " (id " +
-          me.json.id +
-          ")"
+
+    if (!me || me.status !== 200) {
+      console.error(
+        "[Yukina-Bot] Não consegui validar o token (ainda em rate limit?). Health segue ativo; tente de novo em 15–30 min SEM deploy."
       );
-    } else {
-      console.warn("[Yukina-Bot] REST /users/@me HTTP " + me.status);
+      return;
     }
 
     console.log("[Yukina-Bot] Conectando ao gateway...");
     const loginTimeout = setTimeout(() => {
       console.error(
-        "[Yukina-Bot] Login não completou em 45s. Verifique token, intents e rede."
+        "[Yukina-Bot] Login não completou em 90s. Se houver 429, espere 15–30 min sem restart."
       );
-    }, 45000);
+    }, 90000);
 
     await client.login(TOKEN);
     clearTimeout(loginTimeout);
@@ -278,10 +300,5 @@ process.on("unhandledRejection", (r) => {
       "[Yukina-Bot] Falha no login:",
       err && err.message ? err.message : err
     );
-    if (String(err && err.message).includes("token") || err.code === "TokenInvalid") {
-      console.error(
-        "[Yukina-Bot] Gere um token NOVO no portal e cole em DISCORD_TOKEN no Render."
-      );
-    }
   }
 })();
